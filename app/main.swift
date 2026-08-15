@@ -19,7 +19,7 @@ import Darwin
 //   方案（零补丁，不动 ComicReader）: 自愈回填 code 键 —— 与 FUNC_A 自家写码同机制
 //         (dictionaryWithContentsOfFile + setObject + writeToFile:atomically:)：
 //   1. 捕获 code 值双备份: UserDefaults(类型保真) + /var/mobile/hudctl_state.txt(人类可读)
-//   2. code 缺失（含文件不存在）→ 自动回填（备份值优先，无备份用合成值 "hudctl-refill"）;
+//   2. code 缺失（含文件不存在）→ 自动回填（备份值优先，无备份用合成值 "hudctl-refill-placeholder"（>15B 走 cstring，便于审计））;
 //      节流 10s 防与后台重验 FUNC_B 对刷; 写后重读确认
 //   3. spawn 前强制回填一次（对抗删除竞态）再 posix_spawn
 //   4. 写回前查文件可写性，失败把 errno 显示在诊断行
@@ -31,7 +31,7 @@ let kContainerDataRoots = ["/var/mobile/Containers/Data/Application", "/var/mobi
 let kPrefsPlistPrimary = "/var/mobile/Library/Preferences/com.DFMvios.plist"
 let kDismissalNotify = "com.test.notification.hud.dismissal"
 let kCodeBackupFile = "/var/mobile/hudctl_state.txt"
-let kHealSyntheticCode = "hudctl-refill"
+let kHealSyntheticCode = "hudctl-refill-placeholder"
 let kLastCodeKey = "hudctl_last_code"
 let kRefillThrottle: TimeInterval = 10.0
 
