@@ -2,36 +2,46 @@ import UIKit
 import Darwin
 
 // ============================================================
-// HUDControl JB 直连版 v3（许可证自愈）- 单按钮 toggle（启动 HUD ⇄ 关闭 HUD）
+// HUDControl JB 直连版 v3.1（rootless 适配 + 许可证自愈）- 单按钮 toggle
 // 越狱 no-sandbox 环境：所有动作直连，无 daemon 依赖
 //   start: posix_spawn(<自动探测的 ComicReader 路径>, ["-hud"], environ)  // 镜像 C5 argv
 //   stop : notify_post("com.test.notification.hud.dismissal") + kill(pid, SIGKILL) 兜底
 //   状态 : sysctl KERN_PROC_ALL + KERN_PROCARGS2 匹配 argv 含 "-hud" 的 ComicReader 进程
-//   验证 : plist 深度探测（系统路径 → 容器路径自动探测）
+//   验证 : plist 深度探测（rootful 系统路径 → rootless jbroot 路径 → App 容器路径）
 //
 // v2（诊断）: errno 持久行 / 二进制路径自动探测 / plist 容器扫描
 // v2.1（plist 深度探测）: uid/mode/size/mtime / 直读+cfprefsd 双通道 / ▲差异行 / code 自动备份
-// v3（许可证自愈，2026-08-15）:
-//   背景: T13 实锤 LIC_B(0x100036d70) 用 dictionaryWithContentsOfFile 直读文件 +
-//         objectForKey:@"code"（键存在即放行）; FUNC_B(0x10003dd54) 删 code 键 +
-//         writeToFile:atomically: 直写。@x 实测"过期后第一次能起、后续失效" =
-//         code 键被 FUNC_B 删除。T13 三态模拟: plist=nil → 清零写; code 在 → 启用路径。
-//   方案（零补丁，不动 ComicReader）: 自愈回填 code 键 —— 与 FUNC_A 自家写码同机制
-//         (dictionaryWithContentsOfFile + setObject + writeToFile:atomically:)：
-//   1. 捕获 code 值双备份: UserDefaults(类型保真) + /var/mobile/hudctl_state.txt(人类可读)
-//   2. code 缺失（含文件不存在）→ 自动回填（备份值优先，无备份用合成值 "hudctl-refill-placeholder"（>15B 走 cstring，便于审计））;
-//      节流 10s 防与后台重验 FUNC_B 对刷; 写后重读确认
-//   3. spawn 前强制回填一次（对抗删除竞态）再 posix_spawn
-//   4. 写回前查文件可写性，失败把 errno 显示在诊断行
+// v3（许可证自愈）: 捕获/备份 code，缺失自动回填（备份值/合成值），spawn 前强制回填，10s 节流
+// v3.1（rootless 适配，2026-08-15）:
+//   @x 实锤设备是 rootless 越狱（palera1n 系 AppGroup .jbroot-* 路径）：
+//     - plist 真实落盘 = /var/mobile/Containers/Shared/AppGroup/.jbroot-*/var/root/Library/Preferences/com.DFMvios.plist
+//       （在 root 的 HOME 下 ⇒ 写者是 root 身份运行的 ComicReader）
+//     - 用户上传该 plist 实测：唯一键 code = 3C45276381（10 位 hex，XML plist）
+//   ⇒ 旧版硬编码 /var/mobile/Library/Preferences 与 /Applications 在 rootless 下全部落空：
+//     "点击启动无效 + plist 不可读" = 路径问题（不是权限/沙盒）
+//   ⇒ 本版新增：
+//     1. jbroot 路径自动探测：/var/jb/... → AppGroup .jbroot-* glob（exe + plist 双探）
+//     2. uid/egid + NSHomeDirectory 显示（判断 root 还是 mobile 身份运行，
+//        决定写哪个 HOME 的 plist、能否 kill root HUD）
+//     3. 回填目标 = 已存在 plist ∪ {root-HOME, mobile-HOME} jbroot 双写（覆盖两种运行身份）
+//     4. 内置种子 code = 本机实测值 3C45276381（@x 上传 plist 实证；
+//        "过期旧值仍能过门" ⇒ 门只查存在性/可解析性，不校验值 ⇒ 种子对该设备永久有效）
 // ============================================================
 
 let kComicExePrimary = "/Applications/ComicReader.app/ComicReader"
+let kJBRoot = "/var/jb"
+let kAppGroupRoot = "/var/mobile/Containers/Shared/AppGroup"
+let kExeRel = "Applications/ComicReader.app/ComicReader"
 let kContainerBundleRoots = ["/var/containers/Bundle/Application", "/var/mobile/Applications"]
 let kContainerDataRoots = ["/var/mobile/Containers/Data/Application", "/var/mobile/Applications"]
 let kPrefsPlistPrimary = "/var/mobile/Library/Preferences/com.DFMvios.plist"
+// rootless：root 身份运行的 ComicReader 把 plist 写在自已的 HOME（/var/root → jbroot/var/root）
+let kPlistRelRootHome = "var/root/Library/Preferences/com.DFMvios.plist"
+let kPlistRelMobileHome = "var/mobile/Library/Preferences/com.DFMvios.plist"
 let kDismissalNotify = "com.test.notification.hud.dismissal"
 let kCodeBackupFile = "/var/mobile/hudctl_state.txt"
 let kHealSyntheticCode = "hudctl-refill-placeholder"
+let kSeedCode = "3C45276381"   // v3.1: 本机实测种子（@x 2026-08-15 上传 plist 的唯一 code 值）
 let kLastCodeKey = "hudctl_last_code"
 let kRefillThrottle: TimeInterval = 10.0
 
@@ -111,7 +121,7 @@ final class ViewController: UIViewController {
         hintLabel.textColor = .tertiaryLabel
         hintLabel.textAlignment = .center
         hintLabel.numberOfLines = 0
-        hintLabel.text = "越狱直连版 v3（许可证自愈）\nstart: posix_spawn -hud | stop: dismissal 通知 + kill 兜底\ncode 缺失自动回填（备份值/合成值），spawn 前强制回填；2 秒自动刷新"
+        hintLabel.text = "越狱直连版 v3.1（rootless 适配 + 许可证自愈）\nstart: posix_spawn -hud | stop: dismissal 通知 + kill 兜底\ncode 缺失自动回填（备份/种子 3C45276381），双 HOME 写盘；2 秒自动刷新"
         view.addSubview(hintLabel)
 
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -127,16 +137,34 @@ final class ViewController: UIViewController {
         stateLabel.frame = CGRect(x: 32, y: 232, width: w - 64, height: 22)
         plistLabel.frame = CGRect(x: 32, y: 258, width: w - 64, height: 118)
         diagLabel.frame  = CGRect(x: 32, y: 380, width: w - 64, height: 62)
-        pathLabel.frame  = CGRect(x: 32, y: 446, width: w - 64, height: 52)
-        hintLabel.frame  = CGRect(x: 32, y: 502, width: w - 64, height: 110)
+        pathLabel.frame  = CGRect(x: 32, y: 446, width: w - 64, height: 66)
+        hintLabel.frame  = CGRect(x: 32, y: 516, width: w - 64, height: 110)
     }
 
-    // ---- 路径探测：系统域 → 容器域（App Store 版）----
+    // ---- 路径探测：系统域 → rootless jbroot（/var/jb → .jbroot-* glob）→ 容器域 ----
     private func resolveComicExe() -> String? {
+        // 1) rootful 系统域（rootless 下若本进程带路径重映射，也会命中 jbroot 里的 app）
         if FileManager.default.fileExists(atPath: kComicExePrimary) {
             comicExeSource = "系统域 /Applications"
             return kComicExePrimary
         }
+        // 2) rootless: /var/jb 符号链接
+        let jbExe = kJBRoot + "/" + kExeRel
+        if FileManager.default.fileExists(atPath: jbExe) {
+            comicExeSource = "rootless /var/jb"
+            return jbExe
+        }
+        // 3) rootless: AppGroup .jbroot-* glob（真实磁盘路径，不依赖重映射）
+        if let subs = try? FileManager.default.contentsOfDirectory(atPath: kAppGroupRoot) {
+            for sub in subs where sub.hasPrefix(".jbroot-") {
+                let exe = kAppGroupRoot + "/" + sub + "/" + kExeRel
+                if FileManager.default.fileExists(atPath: exe) {
+                    comicExeSource = "rootless AppGroup " + sub
+                    return exe
+                }
+            }
+        }
+        // 4) App Store 容器（沙盒原版）
         for root in kContainerBundleRoots {
             guard let subs = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
             for sub in subs {
@@ -157,21 +185,53 @@ final class ViewController: UIViewController {
         comicExe = resolveComicExe()
     }
 
-    // ---- plist 路径探测：系统路径 → 容器路径 ----
-    private func resolvePlist() -> (path: String, exists: Bool) {
-        if FileManager.default.fileExists(atPath: kPrefsPlistPrimary) {
-            return (kPrefsPlistPrimary, true)
+    // ---- plist 候选：rootful 系统路径 → jbroot（root/mobile 双 HOME）→ App 容器 ----
+    private func resolvePlistCandidates() -> [(path: String, exists: Bool)] {
+        var out: [(String, Bool)] = []
+        var seen = Set<String>()
+        func add(_ p: String) {
+            if seen.contains(p) { return }
+            seen.insert(p)
+            out.append((p, FileManager.default.fileExists(atPath: p)))
+        }
+        add(kPrefsPlistPrimary)                     // rootful 系统路径
+        add(kJBRoot + "/" + kPlistRelRootHome)      // rootless /var/jb root HOME
+        add(kJBRoot + "/" + kPlistRelMobileHome)    // rootless /var/jb mobile HOME
+        if let subs = try? FileManager.default.contentsOfDirectory(atPath: kAppGroupRoot) {
+            for sub in subs where sub.hasPrefix(".jbroot-") {
+                add(kAppGroupRoot + "/" + sub + "/" + kPlistRelRootHome)
+                add(kAppGroupRoot + "/" + sub + "/" + kPlistRelMobileHome)
+            }
         }
         for root in kContainerDataRoots {
             guard let subs = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
             for sub in subs {
-                let p = root + "/" + sub + "/Library/Preferences/com.DFMvios.plist"
-                if FileManager.default.fileExists(atPath: p) {
-                    return (p, true)
-                }
+                add(root + "/" + sub + "/Library/Preferences/com.DFMvios.plist")
             }
         }
+        return out
+    }
+
+    // 探测用：第一个存在的候选（保持旧接口语义）
+    private func resolvePlist() -> (path: String, exists: Bool) {
+        for c in resolvePlistCandidates() where c.exists { return c }
         return (kPrefsPlistPrimary, false)
+    }
+
+    // 回填用：已存在候选 ∪ 两个 jbroot HOME 候选（不存在则创建；rootful 系统路径不存在时不乱建）
+    private func refillTargets() -> [String] {
+        var out: [String] = []
+        var seen = Set<String>()
+        let jbRootHome = kJBRoot + "/" + kPlistRelRootHome
+        let jbMobileHome = kJBRoot + "/" + kPlistRelMobileHome
+        for c in resolvePlistCandidates() {
+            if seen.contains(c.path) { continue }
+            seen.insert(c.path)
+            if c.exists || c.path == jbRootHome || c.path == jbMobileHome {
+                out.append(c.path)
+            }
+        }
+        return out
     }
 
     // ---- 抓到 code 值自动备份（去重追加，人类可读）----
@@ -200,23 +260,19 @@ final class ViewController: UIViewController {
     // T13 实锤：LIC_B 用 dictionaryWithContentsOfFile 直读文件 + objectForKey:@"code"，
     // 键存在即放行（@x 实测过期旧值也能过门，值不校验）；FUNC_B 删键 + writeToFile 直写。
     // 因此回填 = 与 FUNC_A 同机制的写文件即可，cfprefsd 不在关键链路上（不依赖它）。
+    // v3.1：对全部回填目标（已存在 plist + root/mobile 双 HOME jbroot 路径）逐一写盘。
     @discardableResult
     private func refillCode(force: Bool) -> Bool {
         if !force, let lr = lastRefill, Date().timeIntervalSince(lr) < kRefillThrottle {
             return false   // 节流中：防与后台重验 FUNC_B 对刷
         }
-        let (pPath, pExists) = resolvePlist()
-        // 写回前查可写性（FileHandle 打开失败 = 权限问题，errno 可见）
-        if pExists {
-            let fh = FileHandle(forWritingAtPath: pPath)
-            if fh == nil {
-                healLast = "自愈：写失败（无法打开 errno=\(errno)，属主=\(fileOwner(pPath))）"
-                lastRefill = Date()
-                return false
-            }
-            try? fh?.close()
+        let targets = refillTargets()
+        if targets.isEmpty {
+            healLast = "自愈：无回填目标（jbroot 不可达）"
+            lastRefill = Date()
+            return false
         }
-        // 取值优先级：UserDefaults 备份（类型保真）→ txt 备份 → 合成值
+        // 取值优先级：UserDefaults 备份（类型保真）→ txt 备份 → 种子（本机实测）→ 合成值
         var val: Any = kHealSyntheticCode
         var valSrc = "合成值"
         if let saved = UserDefaults.standard.object(forKey: kLastCodeKey) {
@@ -228,22 +284,38 @@ final class ViewController: UIViewController {
                 val = v
                 valSrc = "txt备份"
             }
+        } else {
+            val = kSeedCode
+            valSrc = "种子值(本机实测)"
         }
-        // 与 FUNC_A/FUNC_B 同机制：dictionaryWithContentsOfFile + setObject + writeToFile:atomically:
-        let dict = (pExists ? NSMutableDictionary(contentsOfFile: pPath) : nil) ?? NSMutableDictionary()
-        dict.setObject(val, forKey: "code" as NSString)
-        let ok = dict.write(toFile: pPath, atomically: true)
-        lastRefill = Date()
-        if ok {
-            // 写后重读确认
-            if let rd = NSDictionary(contentsOfFile: pPath), rd.object(forKey: "code") != nil {
-                healLast = "自愈：已回填 code（\(valSrc)，写后重读确认 ✓）"
-                return true
+        var okCount = 0
+        var errs: [String] = []
+        for p in targets {
+            let exists = FileManager.default.fileExists(atPath: p)
+            if exists {
+                let fh = FileHandle(forWritingAtPath: p)
+                if fh == nil {
+                    errs.append("\(p):打不开(errno=\(errno))")
+                    continue
+                }
+                try? fh?.close()
             }
-            healLast = "自愈：已写入但重读无 code（可能被对刷）"
-            return false
+            let dict = (exists ? NSMutableDictionary(contentsOfFile: p) : nil) ?? NSMutableDictionary()
+            dict.setObject(val, forKey: "code" as NSString)
+            let ok = dict.write(toFile: p, atomically: true)
+            if ok, let rd = NSDictionary(contentsOfFile: p), rd.object(forKey: "code") != nil {
+                okCount += 1
+            } else {
+                errs.append("\(p):写入失败")
+            }
         }
-        healLast = "自愈：writeToFile 失败 errno=\(errno)（属主=\(fileOwner(pPath))）"
+        lastRefill = Date()
+        if okCount > 0 {
+            healLast = "自愈：已回填 code（\(valSrc)，\(okCount)/\(targets.count) 路径确认）"
+            if !errs.isEmpty { healLast += " | " + errs.joined(separator: "; ") }
+            return true
+        }
+        healLast = "自愈：全部写入失败（" + errs.joined(separator: "; ") + "）"
         return false
     }
 
@@ -278,7 +350,8 @@ final class ViewController: UIViewController {
                 }
             }
         }
-        // cfprefsd 视角：绕过文件直读，看 cfprefsd 全局域对该键的视图
+        // cfprefsd 视角：绕过文件直读，看 cfprefsd 对该域的视图
+        // 注：rootless 下 cfprefsd（系统进程，无重映射）大概率看不到 jbroot 里的文件 → 显示"无"属正常
         if let v = CFPreferencesCopyAppValue("code" as CFString, "com.DFMvios" as CFString) {
             let s = String(describing: v)
             pr.cfVal = s.count <= 24 ? s : String(s.prefix(16)) + "…(" + String(s.count) + "B)"
@@ -306,7 +379,7 @@ final class ViewController: UIViewController {
     @objc private func tapButton() {
         ensureComicExe()
         guard let exe = comicExe else {
-            lastDiag = "诊断：未找到 ComicReader.app（系统域与容器域均无）"
+            lastDiag = "诊断：未找到 ComicReader.app（系统域/jbroot/容器均无）"
             diagLabel.text = lastDiag
             refresh()
             return
@@ -332,10 +405,10 @@ final class ViewController: UIViewController {
         let r = posix_spawn(&pid, exe, nil, nil, &argv, environ)
         if r == 0 {
             stateLabel.text = "HUD 已启动 (pid=\(pid))"
-            lastDiag = "诊断：spawn OK pid=\(pid) 路径=\(exe) | " + (healed ? "回填✓" : healLast)
+            lastDiag = "诊断：spawn OK pid=\(pid) 路径=\(exe) uid=\(getuid()) | " + (healed ? "回填✓" : healLast)
         } else {
             stateLabel.text = "状态：HUD 未运行"
-            lastDiag = "诊断：spawn 失败 errno=\(r) 路径=\(exe) | " + healLast
+            lastDiag = "诊断：spawn 失败 errno=\(r) 路径=\(exe) uid=\(getuid()) | " + healLast
         }
         diagLabel.text = lastDiag
     }
@@ -349,14 +422,14 @@ final class ViewController: UIViewController {
             _ = kDismissalNotify.withCString { notify_post($0) }
             usleep(1_500_000)
             var killed = 0
+            var failed = 0
             if let pids = self?.hudPids() {
                 for pid in pids {
-                    kill(pid, SIGKILL)
-                    killed += 1
+                    if kill(pid, SIGKILL) == 0 { killed += 1 } else { failed += 1 }
                 }
             }
             DispatchQueue.main.async {
-                self?.lastDiag = "诊断：stop 完成（notify 投递 + kill \(killed) 个进程）"
+                self?.lastDiag = "诊断：stop 完成（notify 投递 + kill \(killed)/\(killed + failed)）"
                 self?.diagLabel.text = self?.lastDiag
                 self?.refresh()
             }
@@ -444,7 +517,7 @@ final class ViewController: UIViewController {
 
         var pText = ""
         if !probe.exists {
-            pText = "验证状态：不可读（系统/容器路径均无 plist）"
+            pText = "验证状态：不可读（系统/jbroot/容器路径均无 plist）"
         } else if probe.readable {
             pText = probe.codeDirect ? "验证状态：有效（code 在）" : "验证状态：已失效（code 被删）"
         } else {
@@ -467,11 +540,12 @@ final class ViewController: UIViewController {
         }
         plistLabel.text = pText
 
-        // 路径显示
+        // 路径显示（v3.1：加 uid/HOME 身份信息）
+        let uidLine = "uid=\(getuid())/egid=\(getegid()) HOME=\(NSHomeDirectory())"
         if let exe = comicExe {
-            pathLabel.text = "ComicReader: " + exe + "\n来源：" + comicExeSource
+            pathLabel.text = uidLine + "\nComicReader: " + exe + "（" + comicExeSource + "）"
         } else {
-            pathLabel.text = "ComicReader: 未找到（系统域与容器域均无）"
+            pathLabel.text = uidLine + "\nComicReader: 未找到（系统域/jbroot/容器均无）"
         }
 
         // 诊断行：refresh 不覆盖，仅空时补一次初值
