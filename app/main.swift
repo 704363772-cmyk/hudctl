@@ -2,19 +2,20 @@ import UIKit
 import Darwin
 
 // ============================================================
-// HUDControl JB 直连版 v2（诊断版）- 单按钮 toggle（启动 HUD ⇄ 关闭 HUD）
+// HUDControl JB 直连版 v2.1（plist 深度探测）- 单按钮 toggle（启动 HUD ⇄ 关闭 HUD）
 // 越狱 no-sandbox 环境：所有动作直连，无 daemon 依赖
 //   start: posix_spawn(<自动探测的 ComicReader 路径>, ["-hud"], environ)  // 镜像 C5 argv
 //   stop : notify_post("com.test.notification.hud.dismissal") + kill(pid, SIGKILL) 兜底
 //   状态 : sysctl KERN_PROC_ALL + KERN_PROCARGS2 匹配 argv 含 "-hud" 的 ComicReader 进程
-//   验证 : 直读 plist 的 code 键（系统路径 → 容器路径自动探测）
+//   验证 : plist 深度探测（系统路径 → 容器路径自动探测）
 //
-// v2 诊断增强（2026-08-15）:
-//   1. 独立诊断行 diagLabel：spawn 失败 errno 停留到下次点击，refresh() 不覆盖
-//   2. 启动时自动探测二进制：/Applications → /var/containers/Bundle/Application/*
-//      → /var/mobile/Applications/*；实际使用的路径显示在界面上；探测不到禁用按钮
-//   3. plist 系统路径不可读时自动扫描容器路径，容器里找到就显示 code 在/不在
-//   4. 探测到容器版自动用它 spawn（能出 HUD 就用，出不了界面报原因）
+// v2（诊断）: errno 持久行 / 二进制路径自动探测 / plist 容器扫描
+// v2.1（plist 深度探测，2026-08-15）:
+//   1. 每次刷新显示 plist 完整状态：实际路径 / 属主 uid / 权限 mode / 大小 / mtime
+//   2. code 键双通道探测：直读文件（NSDictionary）+ cfprefsd 视角（CFPreferences）各试一次
+//   3. 刷新间差异行（▲）：大小/mtime/属主/权限/code 存在性/cfprefsd 变化当场可见，
+//      点按钮前后 plist 怎么变一目了然（判别"重验翻转" vs "首次启动触发翻转"）
+//   4. 捕获到 code 值自动备份 /var/mobile/hudctl_codes.txt（去重，供 v3 回填用）
 // ============================================================
 
 let kComicExePrimary = "/Applications/ComicReader.app/ComicReader"
@@ -22,11 +23,27 @@ let kContainerBundleRoots = ["/var/containers/Bundle/Application", "/var/mobile/
 let kContainerDataRoots = ["/var/mobile/Containers/Data/Application", "/var/mobile/Applications"]
 let kPrefsPlistPrimary = "/var/mobile/Library/Preferences/com.DFMvios.plist"
 let kDismissalNotify = "com.test.notification.hud.dismissal"
+let kCodeBackupFile = "/var/mobile/hudctl_codes.txt"
 
 // notify.h 的 notify_post 在 iOS SDK 的 Swift 模块中未导出（macOS 上可过、iOS 目标报错），
 // 用 @_silgen_name 直接绑定 libsystem_notify 符号，T15 实锤 C1 发布侧用的就是原生 notify_post。
 @_silgen_name("notify_post")
 private func notify_post(_ name: UnsafePointer<CChar>) -> UInt32
+
+// plist 探测快照（每次 refresh 生成一份，与上一次比较产生差异行）
+private struct PlistProbe {
+    var path = ""
+    var exists = false
+    var readable = false
+    var size: Int64 = 0
+    var perms = "-"
+    var owner = "-"
+    var mtime = "-"
+    var codeDirect = false
+    var codeValDesc = "-"
+    var cfVal = "nil"          // cfprefsd 视角：nil 或值摘要
+    var changed = ""           // 与上次相比的变化（空 = 无变化）
+}
 
 final class ViewController: UIViewController {
 
@@ -37,6 +54,7 @@ final class ViewController: UIViewController {
     private let pathLabel = UILabel()
     private let hintLabel = UILabel()
     private var timer: Timer?
+    private var prevProbe: PlistProbe?
 
     // 探测结果缓存 + 最近一次动作诊断（refresh 不覆盖）
     private var comicExe: String?
@@ -58,7 +76,7 @@ final class ViewController: UIViewController {
         stateLabel.textAlignment = .center
         view.addSubview(stateLabel)
 
-        plistLabel.font = .systemFont(ofSize: 13)
+        plistLabel.font = .systemFont(ofSize: 12)
         plistLabel.textAlignment = .center
         plistLabel.numberOfLines = 0
         view.addSubview(plistLabel)
@@ -79,7 +97,7 @@ final class ViewController: UIViewController {
         hintLabel.textColor = .tertiaryLabel
         hintLabel.textAlignment = .center
         hintLabel.numberOfLines = 0
-        hintLabel.text = "越狱直连版 v2（诊断版）\nstart: posix_spawn -hud | stop: dismissal 通知 + kill 兜底\n2 秒自动刷新真实状态；橙色行 = 最近一次动作结果"
+        hintLabel.text = "越狱直连版 v2.1（plist 深度探测）\nstart: posix_spawn -hud | stop: dismissal 通知 + kill 兜底\n2 秒自动刷新；▲行 = 探测变化；code 值自动备份到 /var/mobile/hudctl_codes.txt"
         view.addSubview(hintLabel)
 
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -91,12 +109,12 @@ final class ViewController: UIViewController {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let w = view.bounds.width
-        button.frame     = CGRect(x: 32, y: 130, width: w - 64, height: 120)
-        stateLabel.frame = CGRect(x: 32, y: 266, width: w - 64, height: 24)
-        plistLabel.frame = CGRect(x: 32, y: 296, width: w - 64, height: 66)
-        diagLabel.frame  = CGRect(x: 32, y: 368, width: w - 64, height: 66)
-        pathLabel.frame  = CGRect(x: 32, y: 440, width: w - 64, height: 60)
-        hintLabel.frame  = CGRect(x: 32, y: 506, width: w - 64, height: 90)
+        button.frame     = CGRect(x: 32, y: 120, width: w - 64, height: 100)
+        stateLabel.frame = CGRect(x: 32, y: 232, width: w - 64, height: 22)
+        plistLabel.frame = CGRect(x: 32, y: 258, width: w - 64, height: 118)
+        diagLabel.frame  = CGRect(x: 32, y: 380, width: w - 64, height: 50)
+        pathLabel.frame  = CGRect(x: 32, y: 434, width: w - 64, height: 52)
+        hintLabel.frame  = CGRect(x: 32, y: 490, width: w - 64, height: 100)
     }
 
     // ---- 路径探测：系统域 → 容器域（App Store 版）----
@@ -125,7 +143,7 @@ final class ViewController: UIViewController {
         comicExe = resolveComicExe()
     }
 
-    // ---- plist 探测：系统路径 → 容器路径 ----
+    // ---- plist 路径探测：系统路径 → 容器路径 ----
     private func resolvePlist() -> (path: String, exists: Bool) {
         if FileManager.default.fileExists(atPath: kPrefsPlistPrimary) {
             return (kPrefsPlistPrimary, true)
@@ -140,6 +158,68 @@ final class ViewController: UIViewController {
             }
         }
         return (kPrefsPlistPrimary, false)
+    }
+
+    // ---- 抓到 code 值自动备份（去重追加）----
+    private func captureCode(_ v: String) {
+        let existing = (try? String(contentsOfFile: kCodeBackupFile, encoding: .utf8)) ?? ""
+        if existing.contains(v) { return }
+        let line = v + "  captured=" + Date().description + "\n"
+        if let h = FileHandle(forWritingAtPath: kCodeBackupFile) {
+            h.seekToEndOfFile()
+            h.write(line.data(using: .utf8)!)
+            try? h.close()
+        } else {
+            try? line.write(toFile: kCodeBackupFile, atomically: true, encoding: .utf8)
+        }
+    }
+
+    // ---- plist 深度探测（直读 + cfprefsd 双通道 + 差异行）----
+    private func probePlist(prev: PlistProbe?) -> PlistProbe {
+        let (pPath, pExists) = resolvePlist()
+        var pr = PlistProbe()
+        pr.path = pPath
+        pr.exists = pExists
+        if pExists {
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: pPath) {
+                if let sz = attrs[.size] as? NSNumber { pr.size = sz.int64Value }
+                if let pm = attrs[.posixPermissions] as? NSNumber { pr.perms = String(pm.intValue, radix: 8) }
+                if let uid = attrs[.ownerAccountID] as? NSNumber { pr.owner = "uid=" + uid.stringValue }
+                if let mt = attrs[.modificationDate] as? Date {
+                    let f = DateFormatter()
+                    f.dateFormat = "HH:mm:ss"
+                    pr.mtime = f.string(from: mt)
+                }
+            }
+            if let d = NSDictionary(contentsOfFile: pPath) {
+                pr.readable = true
+                if let v = d.object(forKey: "code") {
+                    pr.codeDirect = true
+                    let s = String(describing: v)
+                    pr.codeValDesc = s.count <= 24 ? s : String(s.prefix(16)) + "…(" + String(s.count) + "B)"
+                    captureCode(s)
+                }
+            }
+        }
+        // cfprefsd 视角：绕过文件直读，看 cfprefsd 全局域对该键的视图
+        if let v = CFPreferencesCopyAppValue("code" as CFString, "com.DFMvios" as CFString) {
+            let s = String(describing: v)
+            pr.cfVal = s.count <= 24 ? s : String(s.prefix(16)) + "…(" + String(s.count) + "B)"
+            if !pr.codeDirect { captureCode(s) }
+        }
+        // 与上一次快照比较 → 差异行
+        if let p = prev {
+            var parts: [String] = []
+            if p.exists != pr.exists { parts.append("文件:" + (p.exists ? "在" : "无") + "→" + (pr.exists ? "在" : "无")) }
+            if p.size != pr.size { parts.append("大小:\(p.size)→\(pr.size)") }
+            if p.mtime != pr.mtime { parts.append("mtime:" + p.mtime + "→" + pr.mtime) }
+            if p.perms != pr.perms { parts.append("权限:" + p.perms + "→" + pr.perms) }
+            if p.owner != pr.owner { parts.append("属主:" + p.owner + "→" + pr.owner) }
+            if p.codeDirect != pr.codeDirect { parts.append("直读code:" + (p.codeDirect ? "在" : "无") + "→" + (pr.codeDirect ? "在" : "无")) }
+            if p.cfVal != pr.cfVal { parts.append("cfprefsd:" + p.cfVal + "→" + pr.cfVal) }
+            if !parts.isEmpty { pr.changed = "▲ " + parts.joined(separator: " | ") }
+        }
+        return pr
     }
 
     @objc private func tapButton() {
@@ -248,7 +328,7 @@ final class ViewController: UIViewController {
         return false
     }
 
-    // ---- 刷新 UI：按钮态 + plist 验证状态 + 路径显示（不覆盖 diagLabel）----
+    // ---- 刷新 UI：按钮态 + plist 深度探测 + 路径显示（不覆盖 diagLabel）----
     fileprivate func refresh() {
         ensureComicExe()
         let running = isHudRunning()
@@ -270,21 +350,28 @@ final class ViewController: UIViewController {
             stateLabel.text = "状态：HUD 未运行"
         }
 
-        // plist 验证状态（系统路径 → 容器路径自动探测）
-        let (pPath, pExists) = resolvePlist()
-        var pText: String
-        if pExists, let d = NSDictionary(contentsOfFile: pPath) {
-            if d.object(forKey: "code") != nil {
-                pText = "验证状态：有效（code 在）"
-            } else {
-                pText = "验证状态：已失效（code 被删）"
-            }
-        } else if pExists {
-            pText = "验证状态：plist 存在但不可读（权限问题）"
+        // ---- plist 深度探测 ----
+        let probe = probePlist(prev: prevProbe)
+        prevProbe = probe
+
+        var pText = ""
+        if !probe.exists {
+            pText = "验证状态：不可读（系统/容器路径均无 plist）"
+        } else if probe.readable {
+            pText = probe.codeDirect ? "验证状态：有效（code 在）" : "验证状态：已失效（code 被删）"
         } else {
-            pText = "验证状态：plist 不可读（系统路径与容器路径均无）"
+            pText = "验证状态：plist 存在但直读失败（权限）"
         }
-        pText += "\nplist: " + pPath + (pExists ? "" : "（不存在）")
+        pText += " | 直读:" + (probe.exists ? (probe.readable ? (probe.codeDirect ? "在" : "无") : "失败") : "无文件")
+        pText += " | cfprefsd:" + (probe.cfVal == "nil" ? "无" : "在")
+        pText += "\n路径: " + probe.path + (probe.exists ? "" : "（不存在）")
+        pText += "\n属主: " + probe.owner + " 权限: " + probe.perms + " 大小: " + (probe.exists ? String(probe.size) + "B" : "-") + " mtime: " + probe.mtime
+        if probe.exists && probe.readable {
+            pText += "\ncode 值: " + probe.codeValDesc + "（已备份）"
+        }
+        if !probe.changed.isEmpty {
+            pText += "\n" + probe.changed
+        }
         plistLabel.text = pText
 
         // 路径显示
