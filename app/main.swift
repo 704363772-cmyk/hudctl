@@ -14,6 +14,11 @@ let kComicExe = "/Applications/ComicReader.app/ComicReader"
 let kDismissalNotify = "com.test.notification.hud.dismissal"
 let kPrefsPlist = "/var/mobile/Library/Preferences/com.DFMvios.plist"
 
+// notify.h 的 notify_post 在 iOS SDK 的 Swift 模块中未导出（macOS 上可过、iOS 目标报错），
+// 用 @_silgen_name 直接绑定 libsystem_notify 符号，T15 实锤 C1 发布侧用的就是原生 notify_post。
+@_silgen_name("notify_post")
+private func notify_post(_ name: UnsafePointer<CChar>) -> UInt32
+
 final class ViewController: UIViewController {
 
     private let button = UIButton(type: .system)
@@ -93,7 +98,7 @@ final class ViewController: UIViewController {
     private func stopHUD() {
         stateLabel.text = "正在关闭 HUD..."
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            notify_post(kDismissalNotify)
+            kDismissalNotify.withCString { notify_post($0) }
             usleep(1_500_000)
             if let pids = self?.hudPids() {
                 for pid in pids {
