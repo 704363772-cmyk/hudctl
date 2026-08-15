@@ -1,3 +1,5 @@
 dist/
 pkg/*.deb
 .DS_Store
+
+.artifacts/
