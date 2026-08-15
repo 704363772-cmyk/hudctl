@@ -1,0 +1,108 @@
+#!/bin/sh
+# hudctl v2 - external HUD control for ComicReader (no app launch needed)
+# channels:
+#   [app]  HUDControl.app button -> notify_post com.ctf.hudctl.start/stop/query (Darwin)
+#   [file] /var/mobile/hudctl.cmd (Filza): start/stop/kill/status
+#   [ssh]  notifyutil -p com.ctf.hudctl.start|stop|query
+# state:  daemon 上报 com.ctf.hudctl.state (notify_set_state + post)，app 读它切按钮
+APP="/Applications/ComicReader.app/ComicReader"
+CMD_FILE="/var/mobile/hudctl.cmd"
+OUT_FILE="/var/mobile/hudctl.out"
+NOTIFY_DISMISS="com.test.notification.hud.dismissal"
+PLIST="/var/mobile/Library/Preferences/com.DFMvios.plist"
+STATE_KEY="com.ctf.hudctl.state"
+
+hud_pid() {
+    ps -ax -o pid=,args= 2>/dev/null | awk '/ComicReader/ && /-hud/ && !/awk/ {print $1; exit}'
+}
+
+state_set() { # $1 = 0|1  (notify_set_state + post，通知 app 刷新按钮)
+    notifyutil -s "$STATE_KEY" "$1" 2>/dev/null
+    notifyutil -p "$STATE_KEY" 2>/dev/null
+}
+
+hud_start() {
+    # spawn HUD as mobile user (501) so CFPreferences reads /var/mobile plist
+    launchctl asuser 501 "$APP" -hud 2>/dev/null &
+    sleep 0.3
+    if [ -z "$(hud_pid)" ]; then
+        (HOME=/var/mobile "$APP" -hud >/dev/null 2>&1 &)
+    fi
+    echo "start: ok (pid=$(hud_pid))" > "$OUT_FILE"
+    state_set 1
+}
+
+hud_stop() {
+    # 1) Darwin dismissal notification - external post, HUD observer receives it
+    notifyutil -p "$NOTIFY_DISMISS" 2>/dev/null
+    sleep 1.5
+    p=$(hud_pid)
+    if [ -n "$p" ]; then
+        kill -9 "$p" 2>/dev/null
+        echo "stop: dismissed + killed $p" > "$OUT_FILE"
+    else
+        echo "stop: dismissed (already gone)" > "$OUT_FILE"
+    fi
+    state_set 0
+}
+
+hud_kill() {
+    p=$(hud_pid)
+    [ -n "$p" ] && kill -9 "$p" 2>/dev/null
+    echo "kill: ${p:-none}" > "$OUT_FILE"
+    state_set 0
+}
+
+hud_report_state() {
+    if [ -n "$(hud_pid)" ]; then state_set 1; else state_set 0; fi
+}
+
+hud_status() {
+    p=$(hud_pid)
+    if [ -n "$p" ]; then st="RUNNING($p)"; else st="not-running"; fi
+    code="?"
+    if [ -f "$PLIST" ]; then
+        if plutil -p "$PLIST" 2>/dev/null | grep -q '"code"'; then code="present(valid)"; else code="absent(expired)"; fi
+    else
+        code="no-plist-file"
+    fi
+    echo "hud=$st code=$code plist=$PLIST" > "$OUT_FILE"
+    hud_report_state
+}
+
+daemon_loop() {
+    # Darwin notify trigger channels (blocking watchers) - HUDControl.app button uses these
+    ( while true; do notifyutil -w com.ctf.hudctl.start 2>/dev/null; hud_start; done ) &
+    ( while true; do notifyutil -w com.ctf.hudctl.stop 2>/dev/null; hud_stop; done ) &
+    ( while true; do notifyutil -w com.ctf.hudctl.query 2>/dev/null; hud_report_state; done ) &
+    # file poll channel (Filza)
+    last=""
+    while true; do
+        if [ -f "$CMD_FILE" ]; then
+            c=$(head -c 64 "$CMD_FILE" 2>/dev/null | tr -d ' \r\n\t')
+            if [ -n "$c" ] && [ "$c" != "$last" ]; then
+                last="$c"
+                case "$c" in
+                    start) hud_start ;;
+                    stop) hud_stop ;;
+                    kill) hud_kill ;;
+                    status) hud_status ;;
+                    *) echo "unknown cmd: $c" > "$OUT_FILE" ;;
+                esac
+                : > "$CMD_FILE"
+                last=""
+            fi
+        fi
+        sleep 1
+    done
+}
+
+case "$1" in
+    start) hud_start ;;
+    stop) hud_stop ;;
+    kill) hud_kill ;;
+    status) hud_status ;;
+    query) hud_report_state ;;
+    daemon) daemon_loop ;;
+    *) echo "usage: hudctl {start|stop|kill|status|query}"; exit 1 ;;
+esac

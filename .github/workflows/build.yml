@@ -1,0 +1,37 @@
+name: build-hudcontrol-jb
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid || true
+
+      - name: Build deb (swiftc + ldid + pack)
+        run: bash package/build_all.sh
+
+      - name: Verify artifact
+        run: |
+          test -f pkg/hudcontrol_jb.deb
+          ls -la pkg/
+          python3 - <<'EOF'
+          import plistlib
+          d = plistlib.load(open('app/entitlements.plist','rb'))
+          assert d.get('platform-application') is True
+          assert d.get('com.apple.private.security.no-sandbox') is True
+          print('entitlements OK')
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HUDControl-jb-deb
+          path: pkg/hudcontrol_jb.deb

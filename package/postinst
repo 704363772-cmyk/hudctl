@@ -1,0 +1,7 @@
+#!/bin/bash
+# HUDControl JB direct - postinst
+# 刷新桌面图标缓存（Sileo/Zebra 装完直接出图标，无需重启）
+if command -v uicache >/dev/null 2>&1; then
+  uicache -p /Applications/HUDControl.app 2>/dev/null || uicache -a
+fi
+exit 0
