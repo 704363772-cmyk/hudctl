@@ -26,8 +26,12 @@ printf 'APPL????' > dist/Applications/HUDControl.app/PkgInfo
 plutil -lint dist/Applications/HUDControl.app/Info.plist
 
 echo "==> [2/4] ldid sign with no-sandbox entitlements"
+BIN=dist/Applications/HUDControl.app/HUDControl
+# swiftc/ld 对 iOS 目标默认做 ad-hoc 签名；ldid 无法原地扩容已有签名（offset>size 断言），先摘除
+codesign --remove-signature "$BIN" 2>/dev/null || true
 if command -v ldid >/dev/null 2>&1; then
-    ldid -S app/entitlements.plist dist/Applications/HUDControl.app/HUDControl
+    # 注意：ldid 只认紧贴式 -S<entitlements>，分离写法会被当成第二个签名目标
+    ldid -Sapp/entitlements.plist "$BIN"
     echo "    ldid: done"
 else
     echo "    ERROR: ldid not found (brew install ldid)"

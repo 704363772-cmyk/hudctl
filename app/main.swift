@@ -98,7 +98,7 @@ final class ViewController: UIViewController {
     private func stopHUD() {
         stateLabel.text = "正在关闭 HUD..."
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            kDismissalNotify.withCString { notify_post($0) }
+            _ = kDismissalNotify.withCString { notify_post($0) }
             usleep(1_500_000)
             if let pids = self?.hudPids() {
                 for pid in pids {
