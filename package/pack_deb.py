@@ -14,9 +14,9 @@ POSTINST = os.path.join(HERE, 'postinst')
 
 CONTROL = """Package: com.ctf.hudcontrol
 Name: HUDControl
-Version: 3.0.0
+Version: 3.1.0
 Architecture: iphoneos-arm
-Description: HUD one-button control for ComicReader (jailbroken direct version). Tap "start HUD" and the button flips to "stop HUD". Runs no-sandbox: spawns the ComicReader -hud helper directly via posix_spawn (mirrors C5 argv), stops it via Darwin notify_post(com.test.notification.hud.dismissal) with kill() fallback. No daemon needed. Install with Sileo/Zebra; postinst refreshes the icon cache so the app appears immediately.
+Description: HUD one-button control for ComicReader (jailbroken direct version). Tap "start HUD" and the button flips to "stop HUD". Runs no-sandbox: spawns the ComicReader -hud helper directly via posix_spawn (mirrors C5 argv), stops it via Darwin notify_post(com.test.notification.hud.dismissal) with kill() fallback. No daemon needed. Install with Sileo/Zebra; postinst refreshes the icon cache so the app appears immediately. v3.1.0 = diagnostic build: persistent errno line, auto-detect ComicReader path (system/container), plist container scan.
 Maintainer: ctf
 Section: Utilities
 """
